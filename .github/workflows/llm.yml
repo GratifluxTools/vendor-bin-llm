@@ -1,0 +1,285 @@
+name: Local LLM Inference
+
+# Web UI（index.php）から workflow_dispatch でプロンプトを受け取り、
+# llama.cpp（CPU）で推論して結果を results/<request_id>.json にコミットする。
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'ユーザープロンプト'
+        required: true
+        type: string
+      request_id:
+        description: 'リクエストID（結果ファイル名）'
+        required: true
+        type: string
+      system_prompt:
+        description: 'システムプロンプト'
+        required: false
+        type: string
+        default: 'あなたは日本語で簡潔に答える優秀なアシスタントです。'
+      max_tokens:
+        description: '最大生成トークン数'
+        required: false
+        type: string
+        default: '512'
+      temperature:
+        description: 'temperature'
+        required: false
+        type: string
+        default: '0.7'
+
+permissions:
+  contents: write
+
+jobs:
+  infer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # ---- モデル（リポジトリ変数 LLM_MODEL_URL で差し替え可能）----
+      # 既定: Qwen3-4B-Instruct-2507 Q4_K_M (2.50GB / 4vCPU CPU で 8〜15 tok/s 目安)
+      MODEL_URL: ${{ vars.LLM_MODEL_URL || 'https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf' }}
+      MODEL_NAME: ${{ vars.LLM_MODEL_NAME || 'Qwen3-4B-Instruct-2507 (Q4_K_M)' }}
+      CTX_SIZE: ${{ vars.LLM_CTX || '8192' }}
+      THREADS: '4'
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare paths
+        id: prep
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          set -euo pipefail
+          ID="$REQUEST_ID"
+          if ! echo "$ID" | grep -Eq '^[A-Za-z0-9_-]{1,64}$'; then
+            echo "::error::invalid request_id"
+            exit 1
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+          MODEL_FILE="$HOME/models/$(basename "${MODEL_URL%%\?*}")"
+          echo "model_file=$MODEL_FILE" >> "$GITHUB_OUTPUT"
+
+          # モデルURLのハッシュをキャッシュキーにする（URLを差し替えたら別キャッシュになる）
+          KEY="llm-gguf-$(printf '%s' "$MODEL_URL" | sha256sum | cut -c1-16)"
+          echo "cache_key=$KEY" >> "$GITHUB_OUTPUT"
+          mkdir -p "$HOME/models"
+          echo "モデル表示名: $MODEL_NAME"
+          echo "モデルURL: $MODEL_URL"
+          echo "保存先: $MODEL_FILE (key=$KEY)"
+
+      # ★ 2回目以降はここで数十秒で復元される（ダウンロード時間ほぼゼロ）
+      - name: Restore model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/models
+          key: ${{ steps.prep.outputs.cache_key }}
+
+      - name: Download model (cache miss only)
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        env:
+          MODEL_FILE: ${{ steps.prep.outputs.model_file }}
+        run: |
+          set -euo pipefail
+          echo "::notice::キャッシュミス → モデルをダウンロードします（初回のみ）"
+          mkdir -p "$(dirname "$MODEL_FILE")"
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 --speed-time 60 --speed-limit 1024 \
+               -o "$MODEL_FILE.part" "$MODEL_URL"
+          mv "$MODEL_FILE.part" "$MODEL_FILE"
+          ls -lh "$MODEL_FILE"
+
+      - name: Install llama.cpp
+        run: |
+          set -euo pipefail
+          BIN_DIR="$HOME/llama-bin"
+          mkdir -p "$BIN_DIR"
+          UA="llm-actions-console"
+
+          # 1) 公式リリースのプリビルド（Ubuntu x64 CPU）を取得。
+          #    "latest" は GPU ビルドのみの回があるため、直近リリースを数ページ走査する。
+          ASSET=""
+          for page in 1 2 3; do
+            JSON=$(curl -sSL -H "User-Agent: $UA" -H "Authorization: Bearer $GH_TOKEN" \
+                   "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30&page=$page" || echo '[]')
+            ASSET=$(printf '%s' "$JSON" | jq -r '
+              [ .[]
+                | (.assets // [])[]
+                | select(.name | test("bin-ubuntu-x64\\.(zip|tar\\.gz)$"))
+                | select(.name | test("cuda|rocm|sycl|openvino|vulkan|cudart|hip|musl") | not)
+                | .browser_download_url ][0] // empty' 2>/dev/null || true)
+            [ -n "$ASSET" ] && break
+          done
+
+          if [ -n "$ASSET" ]; then
+            echo "release asset: $ASSET"
+            curl -sSL -H "User-Agent: $UA" -o /tmp/llama.pkg "$ASSET"
+            case "$ASSET" in
+              *.zip) unzip -q -o /tmp/llama.pkg -d "$BIN_DIR" ;;
+              *)     tar -xzf /tmp/llama.pkg -C "$BIN_DIR" ;;
+            esac
+          fi
+
+          SERVER=$(find "$BIN_DIR" -type f -name 'llama-server' | head -n1 || true)
+
+          # 2) 見つからなければソースからビルド（フォールバック）
+          if [ -z "$SERVER" ]; then
+            echo "::warning::プリビルドを取得できないため、ソースからビルドします（数分）"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq build-essential cmake libcurl4-openssl-dev
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp /tmp/llama.cpp
+            cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+            cmake --build /tmp/llama.cpp/build --target llama-server -j"$(nproc)"
+            SERVER=$(find /tmp/llama.cpp/build -type f -name 'llama-server' | head -n1)
+            cp "$SERVER" "$BIN_DIR/"
+          fi
+
+          chmod +x "$SERVER"
+          echo "LLAMA_SERVER=$SERVER" >> "$GITHUB_ENV"
+          "$SERVER" --version 2>&1 | head -n 5 || true
+
+      - name: Run inference
+        env:
+          PROMPT: ${{ inputs.prompt }}
+          SYSTEM_PROMPT: ${{ inputs.system_prompt }}
+          MAX_TOKENS: ${{ inputs.max_tokens }}
+          TEMPERATURE: ${{ inputs.temperature }}
+          MODEL_FILE: ${{ steps.prep.outputs.model_file }}
+          REQUEST_ID: ${{ steps.prep.outputs.id }}
+        run: |
+          set -euo pipefail
+
+          # 数値はサニタイズ（プロンプトは env 経由で渡しているのでシェル注入されない）
+          MAX_TOKENS=$(printf '%s' "${MAX_TOKENS:-512}" | tr -cd '0-9' | cut -c1-4); MAX_TOKENS=${MAX_TOKENS:-512}
+          TEMPERATURE=$(printf '%s' "${TEMPERATURE:-0.7}" | tr -cd '0-9.' | cut -c1-4); TEMPERATURE=${TEMPERATURE:-0.7}
+          [ "$MAX_TOKENS" -gt 2048 ] && MAX_TOKENS=2048 || true
+          [ "$MAX_TOKENS" -lt 32 ] && MAX_TOKENS=32 || true
+
+          echo "モデルを起動中... ($MODEL_NAME)"
+          "$LLAMA_SERVER" \
+            -m "$MODEL_FILE" \
+            -c "$CTX_SIZE" \
+            -t "$THREADS" \
+            -ngl 0 \
+            --host 127.0.0.1 --port 8080 \
+            > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+
+          OK=0
+          for i in $(seq 1 150); do
+            if curl -sf http://127.0.0.1:8080/health > /dev/null 2>&1; then OK=1; break; fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo "server process died"; break; fi
+            sleep 2
+          done
+          if [ "$OK" != "1" ]; then
+            echo "::error::llama-server の起動に失敗しました"
+            tail -n 60 /tmp/server.log || true
+            exit 1
+          fi
+          echo "server ready: $(curl -s http://127.0.0.1:8080/health)"
+
+          # チャットテンプレートはモデル内蔵のものがサーバー側で自動適用される
+          jq -n \
+            --arg sys "$SYSTEM_PROMPT" \
+            --arg user "$PROMPT" \
+            --argjson mt "$MAX_TOKENS" \
+            --argjson temp "$TEMPERATURE" \
+            '{messages:[{role:"system",content:$sys},{role:"user",content:$user}],
+              max_tokens:$mt, temperature:$temp, stream:false}' > /tmp/req.json
+
+          echo "推論開始 (max_tokens=$MAX_TOKENS, temp=$TEMPERATURE)"
+          START=$(date +%s)
+          curl -sS --max-time 1500 \
+            -H 'Content-Type: application/json' \
+            -d @/tmp/req.json \
+            http://127.0.0.1:8080/v1/chat/completions \
+            -o /tmp/out.json || echo "::warning::curl が失敗しました"
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+
+          kill "$SERVER_PID" 2>/dev/null || true
+
+          echo "--- server log (tail) ---"
+          tail -n 20 /tmp/server.log || true
+
+          jq -n \
+            --argjson elapsed "$ELAPSED" \
+            --arg prompt "$PROMPT" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg raw "$(cat /tmp/out.json 2>/dev/null || echo '{}')" \
+            '{elapsed_sec:$elapsed, prompt:$prompt, system:$system, raw:($raw|fromjson? // {})}' \
+            > /tmp/meta.json
+
+          if jq -e '.raw.choices[0].message' /tmp/meta.json > /dev/null 2>&1; then
+            echo "推論成功 (${ELAPSED}s)"
+          else
+            echo "::warning::推論結果を取得できませんでした"
+            head -c 800 /tmp/out.json || true
+          fi
+
+      - name: Publish result
+        if: always()
+        env:
+          REQUEST_ID: ${{ steps.prep.outputs.id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ID="${REQUEST_ID:-unknown}"
+          mkdir -p results
+
+          STATUS=error
+          ANSWER=""; REASON=""; PT=0; CT=0; TPS=0; ELAPSED=0; ERRORMSG=""
+
+          if jq -e '.raw.choices[0].message' /tmp/meta.json > /dev/null 2>&1; then
+            STATUS=success
+            ANSWER=$(jq -r '.raw.choices[0].message.content // ""' /tmp/meta.json)
+            REASON=$(jq -r '.raw.choices[0].message.reasoning_content // ""' /tmp/meta.json)
+            PT=$(jq -r '.raw.usage.prompt_tokens // 0' /tmp/meta.json)
+            CT=$(jq -r '.raw.usage.completion_tokens // 0' /tmp/meta.json)
+            TPS=$(jq -r '.raw.timings.predicted_per_second // 0' /tmp/meta.json)
+            ELAPSED=$(jq -r '.elapsed_sec // 0' /tmp/meta.json)
+            if awk -v t="$TPS" 'BEGIN{exit !(t=="0"||t=="")}' && [ "${CT:-0}" -gt 0 ] && [ "${ELAPSED:-0}" -gt 0 ]; then
+              TPS=$(awk -v c="$CT" -v e="$ELAPSED" 'BEGIN{printf "%.2f", c/e}')
+            fi
+          else
+            ERRORMSG=$(tail -c 1200 /tmp/server.log 2>/dev/null || echo 'no log')
+          fi
+
+          jq -n \
+            --arg id "$ID" \
+            --arg status "$STATUS" \
+            --arg model "$MODEL_NAME" \
+            --arg answer "$ANSWER" \
+            --arg reasoning "$REASON" \
+            --arg prompt "$(jq -r '.prompt // ""' /tmp/meta.json 2>/dev/null || echo '')" \
+            --arg system "$(jq -r '.system // ""' /tmp/meta.json 2>/dev/null || echo '')" \
+            --argjson pt "${PT:-0}" --argjson ct "${CT:-0}" \
+            --argjson tps "${TPS:-0}" --argjson elapsed "${ELAPSED:-0}" \
+            --arg err "$ERRORMSG" \
+            --arg run_url "$RUN_URL" \
+            --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{request_id:$id, status:$status, model:$model, answer:$answer, reasoning:$reasoning,
+              prompt:$prompt, system:$system,
+              usage:{prompt_tokens:$pt, completion_tokens:$ct},
+              tokens_per_sec:$tps, elapsed_sec:$elapsed,
+              error:($err|if .=="" then null else . end),
+              run_url:$run_url, created_at:$created_at}' > "results/$ID.json"
+
+          cat "results/$ID.json"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "results/$ID.json"
+          git commit -m "result: $ID" || echo "no changes to commit"
+          git pull --rebase --autostash || true
+          git push || echo "::warning::結果の push に失敗（branch protection を確認）"
+
+      - name: Cleanup
+        if: always()
+        run: pkill -f llama-server || true
